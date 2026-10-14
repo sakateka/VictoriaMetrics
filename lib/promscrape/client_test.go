@@ -1,6 +1,8 @@
 package promscrape
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -11,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding/zstd"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
@@ -123,6 +127,81 @@ func newTestAuthConfig(t *testing.T, isTLS bool, ba *promauth.BasicAuthConfig) *
 	return ac
 }
 
+func TestClientReadDataCompressed(t *testing.T) {
+	for _, tc := range []struct {
+		encoding string
+		compress func(data []byte) []byte
+	}{
+		{
+			encoding: "gzip",
+			compress: func(data []byte) []byte {
+				var buf bytes.Buffer
+				gz := gzip.NewWriter(&buf)
+				if _, err := gz.Write(data); err != nil {
+					t.Fatalf("unexpected error: %s", err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatalf("unexpected error: %s", err)
+				}
+				return buf.Bytes()
+			},
+		},
+		{
+			encoding: "zstd",
+			compress: func(data []byte) []byte {
+				return zstd.CompressLevel(nil, data, 1)
+			},
+		},
+	} {
+		t.Run(tc.encoding, func(t *testing.T) {
+			expectedResponse := `metric_name{key="value"} 123` + "\n"
+			var gotAcceptEncoding string
+			srv := newClientTestServer(false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAcceptEncoding = r.Header.Get("Accept-Encoding")
+				w.Header().Set("Content-Encoding", tc.encoding)
+				_, _ = w.Write(tc.compress([]byte(expectedResponse)))
+			}))
+			defer srv.Close()
+
+			c, err := newClient(context.Background(), &ScrapeWork{
+				ScrapeURL:     srv.URL,
+				ScrapeTimeout: 5 * time.Second,
+				MaxScrapeSize: 16000,
+				AuthConfig:    &promauth.Config{},
+			})
+			if err != nil {
+				t.Fatalf("failed to create client: %s", err)
+			}
+
+			var cb chunkedbuffer.Buffer
+			contentEncoding, err := c.ReadData(&cb)
+			if err != nil {
+				t.Fatalf("unexpected error at ReadData: %s", err)
+			}
+			if contentEncoding != tc.encoding {
+				t.Fatalf("unexpected Content-Encoding: got %q, want %q", contentEncoding, tc.encoding)
+			}
+			if gotAcceptEncoding != "zstd, gzip;q=0.5" {
+				t.Fatalf("unexpected Accept-Encoding sent to the target: got %q, want %q", gotAcceptEncoding, "zstd, gzip;q=0.5")
+			}
+			// decompress the downloaded data the same way as scrapeWork does
+			var bb bytesutil.ByteBuffer
+			sw := &scrapeWork{
+				Config: &ScrapeWork{
+					ScrapeURL:     srv.URL,
+					MaxScrapeSize: 16000,
+				},
+			}
+			if err := sw.readFromBuffer(&bb, &cb, contentEncoding); err != nil {
+				t.Fatalf("unexpected error in readFromBuffer: %s", err)
+			}
+			if string(bb.B) != expectedResponse {
+				t.Fatalf("unexpected uncompressed response: got %q, want %q", bb.B, expectedResponse)
+			}
+		})
+	}
+}
+
 func TestClientProxyReadOk(t *testing.T) {
 	ctx := context.Background()
 	f := func(isBackendTLS, isProxyTLS bool, backendAuth, proxyAuth *promauth.BasicAuthConfig) {
@@ -160,12 +239,12 @@ func TestClientProxyReadOk(t *testing.T) {
 		}
 
 		var cb chunkedbuffer.Buffer
-		isGzipped, err := c.ReadData(&cb)
+		contentEncoding, err := c.ReadData(&cb)
 		if err != nil {
 			t.Fatalf("unexpected error at ReadData: %s", err)
 		}
-		if isGzipped {
-			t.Fatalf("the response mustn't be gzipped")
+		if contentEncoding != "" {
+			t.Fatalf("the response mustn't be compressed; got Content-Encoding=%q", contentEncoding)
 		}
 		got, err := io.ReadAll(cb.NewReader())
 		if err != nil {
